@@ -1,391 +1,114 @@
-#include <cstdint>
-#include <vector>
+#include <cstring>
+#include <iostream>
+#include <optional>
+#include <ostream>
 #include <string>
-#include <sstream>
-#include <windows.h>
-#include <ShlObj.h>
-#include "SafeHandle.h"
-#include "StringUtils.h"
+#include <string_view>
+#include <vector>
+#include <expected>
 
-// Enable if the launcher should convert the path of the launch.lua to a "short" windows path.
-// This caused an issue with how SimpleGraphic.dll compares the path to its own, so settings and builds weren't found,
-// so it's disabled for now.
-constexpr auto USE_SHORT_PATHS = false;
+#include "Launcher.hpp"
+#include "LoadLib.hpp"
 
-std::vector<std::wstring> ParseCommandLine()
+constexpr auto WHITE_SPACE = " \t\n\r\f\v";
+
+constexpr std::string trim(std::string_view view)
 {
-	std::vector<std::wstring> commandLine;
-	int dwNumArgs = 0;
-	LPWSTR *wszCommandLineParams = CommandLineToArgvW(GetCommandLineW(), &dwNumArgs);
-	if (wszCommandLineParams != nullptr)
-	{
-		commandLine.reserve(dwNumArgs);
-		for (int dwArg = 0; dwArg < dwNumArgs; dwArg++)
-		{
-			commandLine.push_back(wszCommandLineParams[dwArg]);
-		}
-		LocalFree(wszCommandLineParams);
-	}
-	return commandLine;
+	auto start = view.find_first_not_of(WHITE_SPACE);
+
+	if (start == std::string_view::npos)
+		return {};
+
+	auto end = view.find_last_not_of(WHITE_SPACE);
+	return std::string(view.substr(start, end - start + 1));
 }
 
-bool IsValidLuaFile(const std::wstring &path, std::string &firstLine)
+int main(int argc, char *argv[])
 {
-	// Open the file (SafeHandle will close the file when exiting scope).
-	SafeHandle hFile = CreateFile(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-	if (!hFile.IsValid())
-	{
-		return false;
-	}
+	std::vector<std::string> command_line(argv + 1, argv + argc);
 
-	// Read the first 255 bytes of the file, which should be enough to encompass the first line
-	char szHeader[256]{};
-	DWORD dwBytesRead = 0;
-	if (!ReadFile(hFile.Get(), szHeader, sizeof(szHeader) - 1, &dwBytesRead, nullptr))
-	{
-		return false;
-	}
-	szHeader[dwBytesRead] = 0;
-	hFile.Close();
+    //TODO: do i need to handle Window 8.3 file names as cmd input?
+    //
+	std::optional<std::string> first_script_line =
+		(command_line.size() > 1 ? IsValidLuaFile(command_line[0]) :
+					   std::nullopt);
 
-	// Check for UTF8 BOM
-	char *szHeaderCur = szHeader;
-	if (szHeaderCur[0] == 0xEF && szHeaderCur[1] == 0xBB && szHeaderCur[2] == 0xBF)
-	{
-		szHeaderCur += 3;
-	}
 
-	// Launcher lua files must start with a #@ directive which determines the dll to launch.
-	if (szHeaderCur[0] != '#' || szHeaderCur[1] != '@')
-	{
-		return false;
-	}
+    std::optional<std::filesystem::path> script_path;
+	if (!first_script_line.has_value()) {
+		script_path =
+			FindInstalledScript();
 
-	// Find the end of the line
-	char *szNewLinePos = strchr(szHeaderCur, '\n');
-	if (szNewLinePos == nullptr)
-	{
-		return false;
-	}
-	// Trim any whitespace at the end of the line.
-	while (*szNewLinePos == '\n' || *szNewLinePos == '\r' || isspace(*szNewLinePos))
-	{
-		szNewLinePos--;
-	}
-
-	firstLine = std::string(szHeaderCur, szNewLinePos + 1);
-	return true;
-}
-
-bool InsertPath(std::vector<std::wstring> &commandLine, const std::wstring &path)
-{
-	if constexpr (USE_SHORT_PATHS)
-	{
-		DWORD requiredLength = GetShortPathName(path.c_str(), nullptr, 0);
-		if (requiredLength == 0)
-		{
-			return false;
+		if (!script_path.has_value()) {
+			std::cout
+				<< "ERROR: Could not find a valid launcher lua file."
+				<< std::endl;
+			return 1;
 		}
 
-		std::wstring shortPath(requiredLength, L'\0');
-		requiredLength = GetShortPathName(path.c_str(), shortPath.data(), requiredLength);
-		if (requiredLength == 0)
-		{
-			return false;
-		}
-
-		commandLine.insert(commandLine.begin() + 1, shortPath);
-	}
-	else
-	{
-		commandLine.insert(commandLine.begin() + 1, path);
-	}
-	return true;
-}
-
-bool FindLaunchLua(std::wstring basePath, std::vector<std::wstring> &commandLine, std::string &firstLine)
-{
-	// Unify path separator characters
-	for (size_t i = 0; i < basePath.length(); i++)
-	{
-		if (basePath[i] == L'/')
-		{
-			basePath[i] = L'\\';
-		}
+		first_script_line =
+			IsValidLuaFile(script_path.value());
 	}
 
-	// Remove the trailing slash if it exists
-	if (basePath[basePath.size() - 1] == L'\\')
-	{
-		basePath = basePath.substr(0, basePath.size() - 1);
-	}
-
-	// Look for Launch.lua directly in the base path
-	std::wstring launchPath = basePath + L"\\Launch.lua";
-	if (IsValidLuaFile(launchPath, firstLine))
-	{
-		return InsertPath(commandLine, launchPath);
-	}
-
-	// Look for src\\Launch.lua
-	launchPath = basePath + L"\\src\\Launch.lua";
-	if (IsValidLuaFile(launchPath, firstLine))
-	{
-		return InsertPath(commandLine, launchPath);
-	}
-
-	// If the base path ends with "runtime" then strip that off, append "src" and look for Launch.lua there
-	static const std::wstring runtime = L"runtime";
-	if (basePath.length() > runtime.length() + 1)
-	{
-		// Find the last slash
-		const size_t lastSlash = basePath.find_last_of(L'\\');
-		if (lastSlash != std::wstring::npos)
-		{
-			// Extract the full subdirectory name
-			std::wstring subDir = basePath.substr(lastSlash + 1);
-			for (size_t i = 0; i < subDir.size(); i++)
-			{
-				subDir[i] = towlower(subDir[i]);
-			}
-			if (subDir == runtime)
-			{
-				std::wstring parentPath = basePath.substr(0, lastSlash);
-				launchPath = parentPath + L"\\src\\Launch.lua";
-				if (IsValidLuaFile(launchPath, firstLine))
-				{
-					return InsertPath(commandLine, launchPath);
-				}
-			}
-		}
-	}
-	return false;
-}
-
-bool InsertLaunchLua(std::vector<std::wstring> &commandLine, std::string &firstLine)
-{
-	// Determine if the first command-line parameter is the location of a valid launcher lua file
-	if (commandLine.size() > 1 && IsValidLuaFile(commandLine[1], firstLine))
-	{
-		// Convert the path of the file to the long version
-		if (commandLine[1].size() > 3 && iswupper(commandLine[1][0]) && commandLine[1][1] == ':' && commandLine[1][2] == '\\')
-		{
-			wchar_t wszLongPath[MAX_PATH]{};
-			if (GetLongPathName(commandLine[1].c_str(), wszLongPath, MAX_PATH) != 0)
-			{
-				commandLine[1] = wszLongPath;
-			}
-		}
-		return true;
-	}
-
-	// Search for the Launch.lua file in various locations it may exist
-
-	// Look in the same directory as the executable
-	{
-		wchar_t wszModuleFilename[MAX_PATH]{};
-		if (GetModuleFileName(nullptr, wszModuleFilename, MAX_PATH) > 0)
-		{
-			wchar_t *wszLastSlash = wcsrchr(wszModuleFilename, '\\');
-			if (wszLastSlash != nullptr)
-			{
-				std::wstring basePath(wszModuleFilename, wszLastSlash + 1);
-				if (FindLaunchLua(basePath, commandLine, firstLine))
-				{
-					return true;
-				}
-			}
-		}
-	}
-
-	// Check for the registry key left by the installer
-	// HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Path of Building Community[ (PoE2)]\InstallLocation
-	{
-		DWORD dwType = 0;
-		DWORD dwSize = MAX_PATH;
-		wchar_t wszValue[MAX_PATH]{};
-#ifndef GAMEVERSION_2
-		DWORD dwStatus = RegGetValue(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Path of Building Community", L"InstallLocation", RRF_RT_REG_SZ, &dwType, wszValue, &dwSize);
-#else
-		DWORD dwStatus = RegGetValue(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Path of Building Community (PoE2)", L"InstallLocation", RRF_RT_REG_SZ, &dwType, wszValue, &dwSize);
-#endif	
-		if (dwStatus == ERROR_SUCCESS && dwSize > sizeof(wchar_t))
-		{
-			// Strip the quotes around the value
-			std::wstring basePath = wszValue[0] == L'\"' ? std::wstring(wszValue + 1, wszValue + dwSize / sizeof(wchar_t) - 2) : std::wstring(wszValue, wszValue + dwSize / sizeof(wchar_t) - 1);
-			if (FindLaunchLua(basePath, commandLine, firstLine))
-			{
-				return true;
-			}
-		}
-	}
-
-	// Look in the %APPDATA% folder, which is where the PoB Fork installer puts the lua files
-	{
-		wchar_t wszAppDataPath[MAX_PATH]{};
-		if (SHGetSpecialFolderPath(nullptr, wszAppDataPath, CSIDL_APPDATA, false))
-		{
-			std::wstring basePath(wszAppDataPath);
-#ifndef GAMEVERSION_2
-			basePath += L"\\Path of Building Community\\";
-#else
-			basePath += L"\\Path of Building Community (PoE2)\\";
-#endif
-			if (FindLaunchLua(basePath, commandLine, firstLine))
-			{
-				return true;
-			}
-		}
-	}
-#ifndef GAMEVERSION_2
-	// Look in the %PROGRAMDATA% folder, which is where the original PoB installer puts the lua files
-	{
-		wchar_t wszAppDataPath[MAX_PATH]{};
-		if (SHGetSpecialFolderPath(nullptr, wszAppDataPath, CSIDL_COMMON_APPDATA, false))
-		{
-			std::wstring basePath(wszAppDataPath);
-			basePath += L"\\Path of Building\\";
-			if (FindLaunchLua(basePath, commandLine, firstLine))
-			{
-				return true;
-			}
-		}
-	}
-#endif
-
-	return false;
-}
-
-bool isDevScript(std::wstring scriptPath) 
-{
-	const auto finalSlash = scriptPath.find_last_of(L'\\');
-	if (finalSlash == std::wstring::npos || finalSlash == 0)
-	{
-		return false;
-	}
-	const auto nextToLastSlash = scriptPath.find_last_of(L'\\', finalSlash - 1);
-	if (nextToLastSlash == std::wstring::npos)
-	{
-		return false;
-	}
-	return scriptPath.compare(nextToLastSlash + 1, finalSlash - 1 - nextToLastSlash, L"src") == 0;
-}
-
-std::vector<std::string> ConvertToUTF8(std::vector<std::wstring> commandLine)
-{
-	std::vector<std::string> commandLineUTF8;
-	if (commandLine.size() > 0)
-	{
-		commandLineUTF8.reserve(commandLine.size());
-		for (const std::wstring &param : commandLine)
-		{
-			int dwUTF8Size = WideCharToMultiByte(CP_UTF8, 0, param.c_str(), (int)param.size(), NULL, 0, NULL, NULL);
-			std::string paramUTF8(dwUTF8Size, 0);
-			WideCharToMultiByte(CP_UTF8, 0, param.c_str(), (int)param.size(), paramUTF8.data(), dwUTF8Size, NULL, NULL);
-			commandLineUTF8.emplace_back(std::move(paramUTF8));
-		}
-	}
-	return commandLineUTF8;
-}
-
-void InitConsole()
-{
-	static bool initialized = false;
-	if (initialized)
-	{
-		return;
-	}
-
-	AllocConsole();
-	FILE *fDummy = nullptr;
-	freopen_s(&fDummy, "CONIN$", "r", stdin);
-	freopen_s(&fDummy, "CONOUT$", "w", stderr);
-	freopen_s(&fDummy, "CONOUT$", "w", stdout);
-	initialized = true;
-}
-
-// Entry function
-int CALLBACK wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ PWSTR lpCmdLine, _In_ int nCmdShow)
-{
-	// Store all the commandline parameters into a vector for easy manipulation
-	std::vector<std::wstring> commandLine = ParseCommandLine();
-
-	// Determine if the first parameter is a path to a valid lua file and insert one if it is not
-	std::string firstLine;
-	if (!InsertLaunchLua(commandLine, firstLine))
-	{
-		InitConsole();
-		wprintf(L"ERROR: Could not find a valid launcher lua file.");
+	if (!first_script_line.has_value()) {
+		std::cout << "ERROR: Could not find a valid launcher lua file."
+			  << std::endl;
 		return 1;
 	}
 
-	// Determine the DLL to load
-	std::wstring dllName(firstLine.begin() + 2, firstLine.end());
-	trim(dllName);
-	if (wcsstr(dllName.c_str(), L".dll") == nullptr)
-	{
-		dllName += L".dll";
-	}
+    command_line.insert(command_line.begin(),script_path.value().string());
 
-	if (isDevScript(commandLine[1])) {
-		LoadLibrary(L"lua51.dll");
-	}
+	std::string lib_name(first_script_line.value().begin() + 2,
+			     first_script_line.value().end());
 
-	// Load the DLL
-	HMODULE hDLL = LoadLibrary(dllName.c_str());
-	if (hDLL == nullptr)
-	{
-		InitConsole();
-		wprintf(L"ERROR: Could not find dll named '%s'\n", dllName.c_str());
-		system("pause");
+	lib_name = trim(lib_name);
+	if (!lib_name.ends_with(".dll"))
+		lib_name.append(".dll");
+
+
+
+
+
+
+    auto simple_graphics = SimpleGraphics::create(lib_name);
+
+	if (!simple_graphics) {
+        std::cout << "ERROR: DLL "<< lib_name <<" does not appear to be a Path of Building dll." << std::endl;;
 		return 1;
 	}
 
-	// Look for a valid entry point to the dll
-	typedef int (*PFNRUNLUAFILEPROC)(int, char **);
-	PFNRUNLUAFILEPROC RunLuaFile = (PFNRUNLUAFILEPROC)GetProcAddress(hDLL, "RunLuaFileAsWin");
-	if (!RunLuaFile) {
-		InitConsole();
-		SetConsoleTitle(commandLine[1].c_str());
-		RunLuaFile = (PFNRUNLUAFILEPROC)GetProcAddress(hDLL, "RunLuaFileAsConsole");
-	}
-	if (!RunLuaFile) {
-		wprintf(L"ERROR: DLL '%s' does not appear to be a Path of Building dll.\n", dllName.c_str());
-		FreeLibrary(hDLL);
-		return 1;
-	}
 
-	// Create a utf8 version of the commandline parameters
-	std::vector<std::string> commandLineUTF8 = ConvertToUTF8(commandLine);
+    // TODO: Handle UTF-8 ?
 
-	// Remove the first commandline argument as the scripts don't care about that.
-	commandLineUTF8.erase(commandLineUTF8.begin());
+    size_t buffer_size = 0;
 
-	// Convert the commandline parameters to a form the DLL can understand
-	size_t dwTotalParamSize = 0;
-	for (const std::string &param : commandLineUTF8)
-	{
-		dwTotalParamSize += param.size() + 1;
-	}
-	size_t dwNumParams = commandLineUTF8.size();
-	std::unique_ptr<char[]> pParamBuf = std::make_unique<char[]>(dwTotalParamSize);
-	char *pCurParamBufLoc = pParamBuf.get();
+    for (auto const& s : command_line)
+	    buffer_size += s.size() + 1;
 
-	std::unique_ptr<char *[]> ppParamList = std::make_unique<char *[]>(dwNumParams);
-	for (size_t i = 0; i < dwNumParams; i++)
-	{
-		ppParamList[i] = pCurParamBufLoc;
+    std::cout << "buffer_size: " << buffer_size << std::endl;
 
-		const std::string &param = commandLineUTF8[i];
-		memcpy(pCurParamBufLoc, param.c_str(), param.size() + 1);
-		pCurParamBufLoc += param.size() + 1;
-	}
+    std::vector<char> storage(buffer_size);
+    std::vector<char*> lua_argv(command_line.size() + 1);
+
+    std::cout << "command_line.size(): " << command_line.size()<< std::endl;
+    char* p = storage.data();
+    for (size_t i = 0; i < command_line.size(); i++) {
+	    std::cout << "LOOP i: " << i << std::endl;
+	    lua_argv[i] = p;
+	    std::cout << "p: " << p << "lua_argv[i]:" << lua_argv[i] << std::endl;
+        std::memcpy(p,command_line[i].data(),command_line[i].size());
+    std::cout << "DEBUG 2" << std::endl;
+        p += command_line[i].size();
+
+    std::cout << "DEBUG 3" << std::endl;
+        *p++ = '\0';
+    }
+
+
+    lua_argv.back() = nullptr;
 
 	// Call into the DLL
-	int dwStatus = RunLuaFile((int)dwNumParams, ppParamList.get());
-
-	// Cleanup the DLL
-	FreeLibrary(hDLL);
+	int dwStatus = simple_graphics.value()(command_line.size(), (char**)lua_argv.data());
 
 	return dwStatus;
 }
